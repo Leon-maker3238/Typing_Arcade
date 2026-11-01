@@ -1,0 +1,311 @@
+import os, sqlite3, secrets, json, time, hashlib
+from datetime import datetime, timezone
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+
+ROOT=os.path.dirname(__file__)
+app=Flask(__name__)
+app.secret_key=os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('HTTPS_ONLY')=='1',MAX_CONTENT_LENGTH=1024*1024)
+DB=os.environ.get('DATABASE_PATH',os.path.join(ROOT,'arcade.db'))
+GAMES=[('obstacle','🏃','Obstacle Course','Dodge obstacles and reach the finish'),('rain','🌧️','Word Rain','Type falling words before they land'),('survival','🏕️','Survival Island','Collect supplies and survive'),('racer','🚗','Typing Racer','Drive, dodge traffic, collect boosts'),('train','🚂','Typing Train','Switch tracks and avoid barriers'),('space','🚀','Space Explorer','Fly among asteroids and gather stars'),('zombie','🧟','Zombie Defender','Defend the base against zombies'),('dino','🦖','Dino Dash','Jump over prehistoric hazards'),('castle','🏰','Spell Castle','Aim magic at approaching enemies'),('ocean','🌊','Ocean Adventure','Swim for treasure and oxygen'),('pizza','🍕','Pizza Rush','Prepare and deliver pizza orders'),('farm','🌾','Farm Frenzy','Plant and harvest crops'),('alien','👾','Alien Invaders','Shoot alien waves'),('tower','🏗️','Tower Builder','Stack blocks carefully'),('ninja','🥷','Keyboard Ninja','Jump and throw stars'),('treasure','🏝️','Treasure Hunt','Find treasure on an island'),('ghost','🏎️','Ghost Racer','Race your personal ghost'),('rhythm','🎵','Rhythm Keys','Hit notes at the right moment'),('escape','🧩','Escape Room','Find clues and unlock the door'),('frenzy','⚡','60-Second Frenzy','Type quickly and build combos')]
+DEFAULT_TIMES={g[0]:(60 if g[0]=='frenzy' else 120) for g in GAMES}
+PRANKS={'frog':('Frog costume',50),'slow':('Slow motion',75),'reverse':('Reverse controls',120),'time':('Time trick',150),'giant':('Giant character',80),'spin':('Screen wobble',100),'freeze':('Freeze',125),'fake':('Fake power-up',60)}
+DEFENSES={'block':('Prank block',100),'reflect':('Prank reflector',200),'triple_block':('Triple shield',250),'triple_reflect':('Triple reflector',500)}
+COSTUMES={'ninja':('Ninja',180),'astronaut':('Astronaut',180),'robot':('Robot',180),'wizard':('Wizard',180),'pirate':('Pirate',220),'dinosaur':('Dinosaur',220)}
+HACKS={'double_jump':('Double jump',220),'shield':('Extra shield',160),'boost':('Speed boost',140),'skip':('One skip pass',350),'double_coins':('Double coins for one round',260)}
+
+def db():
+ c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON');return c
+
+def init():
+ with db() as c:
+  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE NOT NULL,first_name TEXT NOT NULL,email TEXT,passhash TEXT NOT NULL,role TEXT DEFAULT 'member',status TEXT DEFAULT 'pending',coins INTEGER DEFAULT 100,xp INTEGER DEFAULT 0,level TEXT DEFAULT 'Normal',costume TEXT DEFAULT '',blocked INTEGER DEFAULT 0,reset_required INTEGER DEFAULT 0,created INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS inventory(user_id INTEGER,item TEXT,qty INTEGER DEFAULT 0,PRIMARY KEY(user_id,item));
+CREATE TABLE IF NOT EXISTS entries(user_id INTEGER,game TEXT,qty INTEGER DEFAULT 0,PRIMARY KEY(user_id,game));
+CREATE TABLE IF NOT EXISTS scores(id INTEGER PRIMARY KEY,user_id INTEGER,game TEXT,score INTEGER,seconds INTEGER,created INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS communities(id INTEGER PRIMARY KEY,name TEXT UNIQUE,description TEXT DEFAULT '',leader_id INTEGER);
+CREATE TABLE IF NOT EXISTS memberships(user_id INTEGER,community_id INTEGER,PRIMARY KEY(user_id,community_id));
+CREATE TABLE IF NOT EXISTS competitions(id INTEGER PRIMARY KEY,title TEXT,game TEXT,starts INTEGER,ends INTEGER,community_id INTEGER,prize INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY,title TEXT,body TEXT,created INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS pranks(id INTEGER PRIMARY KEY,sender INTEGER,target INTEGER,kind TEXT,state TEXT DEFAULT 'pending',created INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER,action TEXT,detail TEXT,created INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,user_id INTEGER,game TEXT,started INTEGER,duration INTEGER,nonce TEXT,finished INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY,user_id INTEGER,game TEXT,started INTEGER DEFAULT (unixepoch()));''')
+  for game,seconds in DEFAULT_TIMES.items():c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)',('time_'+game,str(seconds)))
+  c.execute("INSERT OR IGNORE INTO settings VALUES('pranks_enabled','1')")
+  c.execute("INSERT OR IGNORE INTO settings VALUES('rain_redline','health')")
+  if not c.execute("SELECT 1 FROM users WHERE role='owner'").fetchone():
+   owner=os.environ.get('OWNER_USERNAME');password=os.environ.get('OWNER_PASSWORD')
+   if owner and password and len(password)>=8:
+    c.execute("INSERT INTO users(username,first_name,passhash,role,status,coins) VALUES(?,?,?,'owner','approved',5000)",(owner,owner,generate_password_hash(password)))
+
+def current():
+ uid=session.get('uid')
+ if not uid:return None
+ with db() as c:return c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+
+def login_required(f):
+ @wraps(f)
+ def wrapped(*a,**kw):
+  u=current()
+  if not u:return jsonify(error='Login required'),401 if request.path.startswith('/api/') else redirect('/login')
+  if u['blocked'] or u['status']!='approved':session.clear();return jsonify(error='Account unavailable'),403
+  return f(*a,**kw)
+ return wrapped
+
+def owner_required(f):
+ @wraps(f)
+ @login_required
+ def wrapped(*a,**kw):
+  if current()['role']!='owner':return jsonify(error='Owner only'),403
+  return f(*a,**kw)
+ return wrapped
+
+def csrf_ok():return request.headers.get('X-CSRF-Token')==session.get('csrf') and bool(session.get('csrf'))
+def protect(f):
+ @wraps(f)
+ def wrapped(*a,**kw):
+  if not csrf_ok():return jsonify(error='Invalid security token; refresh page'),403
+  return f(*a,**kw)
+ return wrapped
+
+def log(c,action,detail=''):
+ c.execute('INSERT INTO audit(actor,action,detail) VALUES(?,?,?)',(session.get('uid'),action,str(detail)[:300]))
+
+def info():
+ u=current()
+ with db() as c:
+  settings={r['key']:r['value'] for r in c.execute('SELECT * FROM settings')}
+  inventory={r['item']:r['qty'] for r in c.execute('SELECT item,qty FROM inventory WHERE user_id=?',(u['id'],))} if u else {}
+  entries={r['game']:r['qty'] for r in c.execute('SELECT game,qty FROM entries WHERE user_id=?',(u['id'],))} if u else {}
+  pending=[dict(r) for r in c.execute("SELECT p.id,p.kind,u.username AS sender FROM pranks p JOIN users u ON u.id=p.sender WHERE p.target=? AND p.state='pending'",(u['id'],))] if u else []
+  communities=[dict(r) for r in c.execute('SELECT id,name,description FROM communities')]
+  competitions=[dict(r) for r in c.execute('SELECT id,title,game,starts,ends,prize FROM competitions ORDER BY id DESC LIMIT 20')]
+  announcements=[dict(r) for r in c.execute('SELECT title,body FROM announcements ORDER BY id DESC LIMIT 8')]
+  scores=[dict(r) for r in c.execute('SELECT s.game,s.score,u.username FROM scores s JOIN users u ON u.id=s.user_id ORDER BY s.score DESC LIMIT 30')]
+ return dict(user={k:u[k] for k in ('id','username','first_name','role','coins','xp','level','costume','reset_required')} if u else None,settings=settings,inventory=inventory,entries=entries,pending=pending,communities=communities,competitions=competitions,announcements=announcements,scores=scores,csrf=session.get('csrf'),games=GAMES,pranks=PRANKS,defenses=DEFENSES,costumes=COSTUMES,hacks=HACKS)
+
+@app.get('/')
+def index():return render_template('index.html',data=info())
+@app.get('/login')
+def login_page():return redirect('/')
+@app.post('/api/register')
+def register():
+ d=request.get_json(silent=True) or {};name=str(d.get('username','')).strip().lower();pw=str(d.get('password',''));first=str(d.get('first_name','')).strip()
+ if not 3<=len(name)<=24 or not name.replace('_','').isalnum() or len(pw)<10 or not first:return jsonify(error='Username 3–24 letters/numbers/underscores, first name, and password of 10+ characters required'),400
+ try:
+  with db() as c:c.execute('INSERT INTO users(username,first_name,email,passhash) VALUES(?,?,?,?)',(name,first,str(d.get('email',''))[:120],generate_password_hash(pw)))
+ except sqlite3.IntegrityError:return jsonify(error='Username already taken'),409
+ return jsonify(message='Request submitted. Owner approval is required.')
+@app.post('/api/login')
+def login():
+ d=request.get_json(silent=True) or {};name=str(d.get('username','')).lower();pw=str(d.get('password',''))
+ with db() as c:
+  # lightweight per-username rate limiting
+  key=hashlib.sha256(name.encode()).hexdigest()[:20];now=int(time.time())
+  recent=c.execute("SELECT COUNT(*) FROM attempts WHERE game=? AND started>?",('login_'+key,now-600)).fetchone()[0]
+  if recent>=12:return jsonify(error='Too many attempts. Try later.'),429
+  u=c.execute('SELECT * FROM users WHERE username=? COLLATE NOCASE',(name,)).fetchone()
+  if not u or not check_password_hash(u['passhash'],pw):
+   c.execute('INSERT INTO attempts(user_id,game) VALUES(NULL,?)',('login_'+key,));return jsonify(error='Invalid username or password'),401
+  if u['status']!='approved' or u['blocked']:return jsonify(error='Account pending approval or blocked'),403
+  c.execute('DELETE FROM attempts WHERE game=?',('login_'+key,))
+ session.clear();session['uid']=u['id'];session['csrf']=secrets.token_urlsafe(24)
+ return jsonify(message='Welcome!',user=u['username'])
+@app.post('/api/logout')
+@protect
+def logout():session.clear();return jsonify(ok=True)
+@app.post('/api/password')
+@login_required
+@protect
+def password():
+ d=request.json or {};u=current();new=str(d.get('new',''))
+ if len(new)<10:return jsonify(error='Password must have 10+ characters'),400
+ if not u['reset_required'] and not check_password_hash(u['passhash'],str(d.get('old',''))):return jsonify(error='Old password incorrect'),403
+ with db() as c:c.execute('UPDATE users SET passhash=?,reset_required=0 WHERE id=?',(generate_password_hash(new),u['id']))
+ return jsonify(ok=True)
+@app.get('/api/state')
+def state():return jsonify(info())
+@app.post('/api/typing')
+@login_required
+@protect
+def typing():
+ d=request.json or {};game=str(d.get('game',''));target=str(d.get('target',''));typed=str(d.get('typed',''));elapsed=float(d.get('elapsed',0))
+ if game not in DEFAULT_TIMES or not 4<=elapsed<=300 or len(target)<12 or typed!=target:return jsonify(error='Typing challenge not completed'),400
+ # Server validates a challenge issued in this session; never trust a client-selected phrase alone.
+ expected=session.get('challenge_'+game)
+ if not expected or expected['text']!=target or time.time()-expected['issued']>300:return jsonify(error='Challenge expired; request another'),400
+ session.pop('challenge_'+game,None)
+ accuracy=100;wpm=round(len(target)/5/(elapsed/60));bonus=min(20,max(3,wpm//10))
+ with db() as c:
+  c.execute('INSERT INTO entries(user_id,game,qty) VALUES(?,?,1) ON CONFLICT(user_id,game) DO UPDATE SET qty=qty+1',(current()['id'],game))
+  c.execute('UPDATE users SET coins=coins+?,xp=xp+10 WHERE id=?',(bonus,current()['id']))
+ return jsonify(ok=True,bonus=bonus,wpm=wpm,accuracy=accuracy)
+PHRASES=['Bright stars shine over the quiet ocean.','A clever explorer discovers a hidden treasure.','The little robot races across the green field.','Practice makes every adventure more exciting.','A friendly dragon flies above the mountain.','The racing car speeds around a sharp corner.','Collect the golden coins before sunset arrives.','The brave astronaut explores a distant planet.']
+@app.get('/api/challenge/<game>')
+@login_required
+def challenge(game):
+ if game not in DEFAULT_TIMES:abort(404)
+ text=secrets.choice(PHRASES);session['challenge_'+game]={'text':text,'issued':time.time()};return jsonify(text=text)
+@app.post('/api/start')
+@login_required
+@protect
+def start():
+ game=str((request.json or {}).get('game',''));u=current()
+ if game not in DEFAULT_TIMES:return jsonify(error='Unknown game'),400
+ with db() as c:
+  item=c.execute('SELECT qty FROM entries WHERE user_id=? AND game=?',(u['id'],game)).fetchone()
+  if not item or item['qty']<1:
+   skip=c.execute("SELECT qty FROM inventory WHERE user_id=? AND item='hack_skip'",(u['id'],)).fetchone()
+   if not skip or skip['qty']<1:return jsonify(error='Complete a typing challenge first'),403
+   c.execute("UPDATE inventory SET qty=qty-1 WHERE user_id=? AND item='hack_skip'",(u['id'],))
+  else:c.execute('UPDATE entries SET qty=qty-1 WHERE user_id=? AND game=?',(u['id'],game))
+  duration=int(c.execute('SELECT value FROM settings WHERE key=?',('time_'+game,)).fetchone()[0]);duration=max(20,min(duration or 600,3600))
+  rid=secrets.token_urlsafe(20);nonce=secrets.token_hex(12)
+  c.execute('INSERT INTO rounds(id,user_id,game,started,duration,nonce) VALUES(?,?,?,?,?,?)',(rid,u['id'],game,int(time.time()),duration,nonce))
+ return jsonify(ok=True,round_id=rid,nonce=nonce,duration=duration)
+@app.post('/api/finish')
+@login_required
+@protect
+def finish():
+ d=request.json or {};rid=str(d.get('round_id',''));claimed=max(0,min(int(d.get('score',0)),100000));now=int(time.time())
+ with db() as c:
+  r=c.execute('SELECT * FROM rounds WHERE id=? AND user_id=?',(rid,current()['id'])).fetchone()
+  if not r or r['finished']:return jsonify(error='Round invalid or already finished'),403
+  elapsed=max(1,now-r['started']);max_score=min(100000,elapsed*250+1000)
+  score=min(claimed,max_score);reward=min(80,5+score//150)
+  c.execute('UPDATE rounds SET finished=1 WHERE id=?',(rid,))
+  c.execute('INSERT INTO scores(user_id,game,score,seconds) VALUES(?,?,?,?)',(current()['id'],r['game'],score,elapsed))
+  c.execute('UPDATE users SET coins=coins+?,xp=xp+? WHERE id=?',(reward,min(100,score//100),current()['id']))
+ return jsonify(ok=True,score=score,coins=reward)
+@app.post('/api/buy')
+@login_required
+@protect
+def buy():
+ d=request.json or {};kind=str(d.get('kind',''));item=str(d.get('item',''))
+ catalog={'prank':PRANKS,'defense':DEFENSES,'costume':COSTUMES,'hack':HACKS}.get(kind,{})
+ if item not in catalog:return jsonify(error='Unknown item'),400
+ price=catalog[item][1];u=current()
+ with db() as c:
+  if c.execute('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?',(price,u['id'],price)).rowcount==0:return jsonify(error='Not enough coins'),400
+  c.execute('INSERT INTO inventory(user_id,item,qty) VALUES(?,?,1) ON CONFLICT(user_id,item) DO UPDATE SET qty=qty+1',(u['id'],kind+'_'+item))
+ return jsonify(ok=True)
+@app.post('/api/equip')
+@login_required
+@protect
+def equip():
+ item=str((request.json or {}).get('item',''))
+ with db() as c:
+  if item and not c.execute('SELECT 1 FROM inventory WHERE user_id=? AND item=? AND qty>0',(current()['id'],'costume_'+item)).fetchone():return jsonify(error='Costume not owned'),403
+  c.execute('UPDATE users SET costume=? WHERE id=?',(item,current()['id']))
+ return jsonify(ok=True)
+@app.post('/api/prank')
+@login_required
+@protect
+def prank():
+ d=request.json or {};target=str(d.get('target','')).strip().lower();kind=str(d.get('kind',''))
+ if kind not in PRANKS:return jsonify(error='Unknown prank'),400
+ with db() as c:
+  if c.execute("SELECT value FROM settings WHERE key='pranks_enabled'").fetchone()[0]!='1':return jsonify(error='Pranks disabled'),403
+  t=c.execute("SELECT * FROM users WHERE username=? AND status='approved' AND blocked=0",(target,)).fetchone()
+  if not t or t['id']==current()['id']:return jsonify(error='Target not available'),400
+  if c.execute('UPDATE inventory SET qty=qty-1 WHERE user_id=? AND item=? AND qty>0',(current()['id'],'prank_'+kind)).rowcount==0:return jsonify(error='Buy this prank first'),400
+  c.execute('INSERT INTO pranks(sender,target,kind) VALUES(?,?,?)',(current()['id'],t['id'],kind))
+ return jsonify(ok=True)
+@app.post('/api/prank/resolve')
+@login_required
+@protect
+def resolve():
+ pid=int((request.json or {}).get('id',0));uid=current()['id']
+ with db() as c:
+  p=c.execute("SELECT * FROM pranks WHERE id=? AND target=? AND state='pending'",(pid,uid)).fetchone()
+  if not p:return jsonify(error='Prank unavailable'),404
+  defense=None
+  for name,qty in [('reflect',1),('triple_reflect',1),('block',1),('triple_block',1)]:
+   if c.execute('UPDATE inventory SET qty=qty-1 WHERE user_id=? AND item=? AND qty>0',(uid,'defense_'+name)).rowcount:
+    defense=name;break
+  if defense and 'reflect' in defense:
+   c.execute("UPDATE pranks SET state='reflected' WHERE id=?",(pid,))
+   # reflected prank applies to sender directly; no second reflection, preventing loops
+   c.execute("INSERT INTO pranks(sender,target,kind,state) VALUES(?,?,?,'reflected_received')",(uid,p['sender'],p['kind']))
+   return jsonify(outcome='reflected',kind=p['kind'])
+  if defense:c.execute("UPDATE pranks SET state='blocked' WHERE id=?",(pid,));return jsonify(outcome='blocked')
+  c.execute("UPDATE pranks SET state='applied' WHERE id=?",(pid,));return jsonify(outcome='applied',kind=p['kind'])
+@app.post('/api/community/join')
+@login_required
+@protect
+def join_community():
+ cid=int((request.json or {}).get('id',0))
+ with db() as c:
+  if not c.execute('SELECT 1 FROM communities WHERE id=?',(cid,)).fetchone():return jsonify(error='Unknown community'),404
+  c.execute('INSERT OR IGNORE INTO memberships VALUES(?,?)',(current()['id'],cid))
+ return jsonify(ok=True)
+@app.get('/api/owner')
+@owner_required
+def owner():
+ with db() as c:
+  return jsonify(users=[dict(r) for r in c.execute('SELECT id,username,first_name,status,role,coins,xp,level,blocked FROM users ORDER BY id DESC')],audit=[dict(r) for r in c.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 60')])
+@app.post('/api/owner/action')
+@owner_required
+@protect
+def owner_action():
+ d=request.json or {};action=str(d.get('action',''));value=d.get('value');uid=int(d.get('user_id',0) or 0)
+ with db() as c:
+  if action in ('approve','decline','block','unblock','set_coins','set_level','reset_progress','reset_password','assistant'):
+   u=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+   if not u or u['role']=='owner':return jsonify(error='Invalid target'),400
+   if action=='approve':c.execute("UPDATE users SET status='approved' WHERE id=?",(uid,))
+   elif action=='decline':c.execute("UPDATE users SET status='declined' WHERE id=?",(uid,))
+   elif action=='block':c.execute('UPDATE users SET blocked=1 WHERE id=?',(uid,))
+   elif action=='unblock':c.execute('UPDATE users SET blocked=0 WHERE id=?',(uid,))
+   elif action=='set_coins':c.execute('UPDATE users SET coins=? WHERE id=?',(max(0,min(int(value),10000000)),uid))
+   elif action=='set_level':
+    if value not in ('Very Easy','Easy','Normal','Hard','Very Hard','Extreme'):return jsonify(error='Invalid level'),400
+    c.execute('UPDATE users SET level=? WHERE id=?',(value,uid))
+   elif action=='reset_progress':
+    c.execute('UPDATE users SET coins=100,xp=0 WHERE id=?',(uid,));c.execute('DELETE FROM inventory WHERE user_id=?',(uid,));c.execute('DELETE FROM scores WHERE user_id=?',(uid,));c.execute('DELETE FROM entries WHERE user_id=?',(uid,))
+   elif action=='reset_password':
+    if len(str(value))<10:return jsonify(error='Temporary password must have 10+ characters'),400
+    c.execute('UPDATE users SET passhash=?,reset_required=1 WHERE id=?',(generate_password_hash(str(value)),uid))
+   elif action=='assistant':c.execute("UPDATE users SET role='assistant' WHERE id=?",(uid,))
+  elif action=='time':
+   game=str(d.get('game',''));seconds=int(value)
+   if game not in DEFAULT_TIMES or seconds not in (0,30,60,90,120,180,300,600,1200,1800,3600):return jsonify(error='Invalid duration'),400
+   c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('time_'+game,str(seconds)))
+  elif action=='community':
+   name=str(value).strip()[:60]
+   if not name:return jsonify(error='Name required'),400
+   c.execute('INSERT INTO communities(name) VALUES(?)',(name,))
+  elif action=='announcement':
+   title=str(d.get('title','')).strip()[:100];body=str(value).strip()[:1000]
+   if not title or not body:return jsonify(error='Title and body required'),400
+   c.execute('INSERT INTO announcements(title,body) VALUES(?,?)',(title,body))
+  elif action=='competition':
+   title=str(d.get('title','')).strip()[:100];game=str(d.get('game',''));hours=max(1,min(int(d.get('hours',24)),720));prize=max(0,min(int(d.get('prize',100)),10000))
+   if not title or game not in DEFAULT_TIMES:return jsonify(error='Invalid competition'),400
+   now=int(time.time());c.execute('INSERT INTO competitions(title,game,starts,ends,prize) VALUES(?,?,?,?,?)',(title,game,now,now+hours*3600,prize))
+  elif action=='pranks_enabled':c.execute("UPDATE settings SET value=? WHERE key='pranks_enabled'",('1' if value else '0',))
+  elif action=='rain_redline':
+   if value not in ('health','instant'):return jsonify(error='Invalid mode'),400
+   c.execute("UPDATE settings SET value=? WHERE key='rain_redline'",(value,))
+  else:return jsonify(error='Unknown action'),400
+  log(c,action,str(value))
+ return jsonify(ok=True)
+@app.post('/api/assistant/block')
+@login_required
+@protect
+def assistant_block():
+ if current()['role']!='assistant':return jsonify(error='Assistant only'),403
+ d=request.json or {};reason=str(d.get('reason','')).strip()[:300];uid=int(d.get('user_id',0))
+ if not reason:return jsonify(error='Reason required'),400
+ with db() as c:
+  target=c.execute('SELECT role FROM users WHERE id=?',(uid,)).fetchone()
+  if not target or target['role']!='member':return jsonify(error='Cannot block this user'),403
+  c.execute('UPDATE users SET blocked=1 WHERE id=?',(uid,));log(c,'assistant_block',f'{uid}: {reason}')
+ return jsonify(ok=True)
+
+init()
+if __name__=='__main__':app.run(host='127.0.0.1',port=int(os.environ.get('PORT',5002)),debug=False)
