@@ -40,7 +40,7 @@ class PgConnection:
         return self
 
     def __exit__(self, *args):
-    return self.conn.__exit__(*args)
+        return self.conn.__exit__(*args)
 
 def re_sql(sql):
  # The game uses SQLite's INSERT OR IGNORE syntax in two places.
