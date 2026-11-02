@@ -2,6 +2,7 @@ import os, sqlite3, secrets, json, time, hashlib
 try:
  import psycopg
  from psycopg.rows import dict_row
+ from psycopg_pool import ConnectionPool
 except ImportError:
  psycopg = None
  dict_row = None
@@ -26,8 +27,9 @@ HACKS={'double_jump':('Double jump',220),'shield':('Extra shield',160),'boost':(
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 class PgConnection:
- def __init__(self, url):
-  self.conn = psycopg.connect(url, row_factory=dict_row, connect_timeout=15)
+def __init__(self, url):
+    self.conn = pool.getconn()
+    self.conn.row_factory = dict_row
  def execute(self, sql, params=()):
   sql = sql.replace('?', '%s')
   sql = re_sql(sql)
@@ -35,8 +37,11 @@ class PgConnection:
  def __enter__(self):
   self.conn.__enter__()
   return self
- def __exit__(self, *args):
-  return self.conn.__exit__(*args)
+def __exit__(self, *args):
+    try:
+        return self.conn.__exit__(*args)
+    finally:
+        pool.putconn(self.conn)
 
 def re_sql(sql):
  # The game uses SQLite's INSERT OR IGNORE syntax in two places.
@@ -45,7 +50,13 @@ def re_sql(sql):
  # PostgreSQL does not provide SQLite's NOCASE collation.
  sql = sql.replace('username=%s COLLATE NOCASE', 'LOWER(username)=LOWER(%s)')
  return sql
-
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=0,
+    max_size=3,
+    timeout=15,
+    open=True
+) if DATABASE_URL else None
 def db():
  if DATABASE_URL:
   if psycopg is None:
