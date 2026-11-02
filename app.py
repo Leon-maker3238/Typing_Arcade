@@ -198,7 +198,7 @@ def typing():
  session.pop('challenge_'+game,None)
  accuracy=100;wpm=round(len(target)/5/(elapsed/60));bonus=min(20,max(3,wpm//10))
  with db() as c:
-  c.execute('INSERT INTO entries(user_id,game,qty) VALUES(?,?,1) ON CONFLICT(user_id,game) DO UPDATE SET qty=qty+1',(current()['id'],game))
+  c.execute('INSERT INTO entries(user_id,game,qty) VALUES(?,?,1) ON CONFLICT(user_id,game) DO UPDATE SET qty=entries.qty+1',(current()['id'],game))
   c.execute('UPDATE users SET coins=coins+?,xp=xp+10 WHERE id=?',(bonus,current()['id']))
  return jsonify(ok=True,bonus=bonus,wpm=wpm,accuracy=accuracy)
 PHRASES=['Bright stars shine over the quiet ocean.','A clever explorer discovers a hidden treasure.','The little robot races across the green field.','Practice makes every adventure more exciting.','A friendly dragon flies above the mountain.','The racing car speeds around a sharp corner.','Collect the golden coins before sunset arrives.','The brave astronaut explores a distant planet.']
