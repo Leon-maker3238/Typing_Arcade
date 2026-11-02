@@ -252,7 +252,7 @@ def buy():
  price=catalog[item][1];u=current()
  with db() as c:
   if c.execute('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?',(price,u['id'],price)).rowcount==0:return jsonify(error='Not enough coins'),400
-  c.execute('INSERT INTO inventory(user_id,item,qty) VALUES(?,?,1) ON CONFLICT(user_id,item) DO UPDATE SET qty=qty+1',(u['id'],kind+'_'+item))
+  c.execute('INSERT INTO inventory(user_id,item,qty) VALUES(?,?,1) ON CONFLICT(user_id,item) DO UPDATE SET qty=inventory.qty+1',(u['id'],kind+'_'+item))
  return jsonify(ok=True)
 @app.post('/api/equip')
 @login_required
