@@ -27,21 +27,24 @@ HACKS={'double_jump':('Double jump',220),'shield':('Extra shield',160),'boost':(
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 class PgConnection:
-def __init__(self, url):
-    self.conn = pool.getconn()
-    self.conn.row_factory = dict_row
- def execute(self, sql, params=()):
-  sql = sql.replace('?', '%s')
-  sql = re_sql(sql)
-  return self.conn.execute(sql, params)
- def __enter__(self):
-  self.conn.__enter__()
-  return self
-def __exit__(self, *args):
-    try:
-        return self.conn.__exit__(*args)
-    finally:
-        pool.putconn(self.conn)
+    def __init__(self, url):
+        self.conn = pool.getconn()
+        self.conn.row_factory = dict_row
+
+    def execute(self, sql, params=()):
+        sql = sql.replace('?', '%s')
+        sql = re_sql(sql)
+        return self.conn.execute(sql, params)
+
+    def __enter__(self):
+        self.conn.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        try:
+            return self.conn.__exit__(*args)
+        finally:
+            pool.putconn(self.conn)
 
 def re_sql(sql):
  # The game uses SQLite's INSERT OR IGNORE syntax in two places.
